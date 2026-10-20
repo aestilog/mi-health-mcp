@@ -64,6 +64,32 @@ mi-fitness-mcp sync --type abnormal_heart_beat --start-date 2026-06-01 --end-dat
 
 `_dedupe_by_timestamp` 过去把 `time` 缺失或非法的记录一律归到 `timestamp=0` 这一个桶里，于是几条互不相关的记录被合并成一条、只留最大值，静默丢数据。现在这类记录按位置各自成组，原样保留。当前云端返回都带 `time`，实际没触发过，但接口一变更就会踩到。
 
+## 已知限制
+
+这些是当前实现的实际短板，不是待办清单 —— 记录在此，避免使用者踩到后误以为数据本身有问题。
+
+### 数据可得性
+
+| 项 | 现状 | 原因 |
+|---|---|---|
+| 体重 / 体成分 | 0 条 | 账号没有小米体脂秤，云端无数据。表结构和 MCP 工具都在，接上秤即可用 |
+| 压力（stress） | 0 条 | 手环不上报该指标 |
+| 睡眠得分 | 176 条全为空 | 云端 `sleep` 响应里没有 `score` 字段 |
+| 深睡时长 | 恒为 0 | 云端 `state` 只返回 `2`/`3`，映射表里 `1=deep` 从未出现。睡眠分期实际只有 light / awake / rem 三档 |
+| GPS 轨迹 | 无 | 只取了距离和步数，运动记录不含轨迹点 |
+
+### 数据口径
+
+- **步数存在约 2% 的系统性偏差**：小米 App 的活动段合并算法不等于「每分钟取最大值」。修复后的数字只能作量级参考，精确值以 App 为准。
+- **午睡未被识别**：云端 `is_nap` 恒为 `false`，54 条 18~44 分钟的午睡（12–16 点开始）全部标成主睡眠。`query_sleep(include_naps=False)` 因此过滤不掉午睡 —— 要排除午睡只能按时长和开始时间自行判断。
+- **睡眠按入睡日期归档**：23:40 入睡、次日 07:44 醒的记录归到入睡那天。查「昨天睡得怎样」要留意这个口径。
+
+### 运维
+
+- **`sync_state.records_count` 永远是 0**：列建了但没有写入逻辑。
+- **无异常数据检测**：同步只负责搬运，不做合理性校验（比如某天步数突然翻十倍不会告警）。
+- **CI 配置是 GitHub Actions**，仓库托管在自建 Gitea，实际不会触发。`pytest` / `ruff` 只能本地手动跑。
+
 ## 功能
 
 - 读取小米运动健康云端数据
@@ -208,19 +234,20 @@ Claude Desktop 配置示例：
 
 ## MCP 工具
 
-- `get_connection_status`
-- `sync_data`
-- `get_profile`
-- `get_daily_summary`
-- `query_metric_series`
-- `query_heart_rate`
-- `query_body_measurements`
-- `query_sleep`
-- `query_workouts`
-- `query_spo2`
-- `query_stress`
-- `query_abnormal_heart_beat`
-- `get_data_coverage`
+- `get_connection_status` — 检查连接状态
+- `sync_data` — 触发同步（支持后台执行）
+- `get_sync_status` — 查后台同步进度
+- `get_profile` — 用户资料
+- `get_daily_summary` — 某天的活动汇总
+- `query_metric_series` — 任意指标时间序列
+- `query_heart_rate` — 心率采样（含静息心率）
+- `query_body_measurements` — 体重与体成分
+- `query_sleep` — 睡眠记录
+- `query_workouts` — 运动记录
+- `query_spo2` — 血氧
+- `query_stress` — 压力
+- `query_abnormal_heart_beat` — 异常心跳事件
+- `get_data_coverage` — 各类型数据覆盖范围
 
 ## 本地数据库
 
