@@ -106,6 +106,9 @@ def _gen_signature(method: str, path: str, values: dict[str, str], signed_nonce:
 
 
 class MiFitnessCloudAdapter(DataAdapter):
+    # 入睡时间相差不超过这么多分钟的睡眠记录视为「同一晚」，只保留信息量最高的一条
+    SLEEP_GROUP_WINDOW_MINUTES = 60
+
     def __init__(
         self, user_id: str | None = None, pass_token: str | None = None, region: str = "ru"
     ):
@@ -556,6 +559,129 @@ class MiFitnessCloudAdapter(DataAdapter):
                 active_kcal=float(values["active_kcal"]),
             )
 
+    def _sleep_record_info(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        """把一条云端睡眠记录解析成构造 ``SleepSession`` 所需的字段。
+
+        不做去重；缺入睡/醒来时间的记录返回 ``None``（保持原行为：跳过）。
+        """
+        payload = self._parse_value(item)
+        zone_offset = int(item.get("zone_offset", 0) or 0)
+        sleep_start = (
+            payload.get("bedtime") or payload.get("device_bedtime") or payload.get("bed_timestamp")
+        )
+        sleep_end = (
+            payload.get("wake_up_time")
+            or payload.get("device_wake_up_time")
+            or payload.get("out_bed_timestamp")
+            or item.get("time")
+        )
+        if not sleep_start or not sleep_end:
+            return None
+
+        start_at = self._timestamp_to_datetime(sleep_start, zone_offset)
+        end_at = self._timestamp_to_datetime(sleep_end, zone_offset)
+        duration_minutes = int(
+            payload.get("duration") or max(0, (int(sleep_end) - int(sleep_start)) // 60)
+        )
+        awake_minutes = int(
+            payload.get("awake_duration") or payload.get("sleep_awake_duration") or 0
+        )
+        asleep_minutes = max(0, duration_minutes - awake_minutes)
+
+        stages: list[SleepStage] = []
+        for segment in payload.get("items", []) or []:
+            try:
+                seg_start = int(segment.get("start_time", 0))
+                seg_end = int(segment.get("end_time", 0))
+                minutes = max(0, (seg_end - seg_start) // 60)
+                if minutes:
+                    stages.append(
+                        SleepStage(
+                            stage=self._sleep_stage_name(segment.get("state")), minutes=minutes
+                        )
+                    )
+            except Exception:
+                continue
+
+        return {
+            "item": item,
+            "payload": payload,
+            "start_at": start_at,
+            "end_at": end_at,
+            "duration_minutes": duration_minutes,
+            "awake_minutes": awake_minutes,
+            "asleep_minutes": asleep_minutes,
+            "stages": stages,
+            "is_nap": self._is_nap_sleep(duration_minutes, end_at, item),
+        }
+
+    @staticmethod
+    def _sleep_classify(info: dict[str, Any]) -> tuple[int, int, int, str]:
+        """按需求文档 4.3 计算一条睡眠记录的信息量排序键，越小越优先保留。
+
+        只分 3 档（同组内按此顺序排序，保留第一条）::
+
+            0  有 state 4（REM）                    → 先比 REM 分钟数，再比 duration
+            1  有真实分期（state 2/3/5，不含 6）      → 先比这些分期的覆盖分钟数，再比 duration
+            2  无任何真实分期（只有 state 6 或无 items）→ 只比 duration，更长者优先
+
+        state 6 的语义是「这段睡眠没有做分期」，信息量与「完全无 items」相同，
+        两者都只有总时长、没有深浅构成，所以合并为同一档；否则 ``{6: 114}`` 会因为
+        多一个占位标记而压过 161 分钟无 items 的记录（实测 2026-05-24 的反例）。
+
+        同档内**不**用入睡时间决胜 —— 那会让早睡的短记录压过晚睡的长记录。
+        入睡时间只作为最后一个维度，在完全平手时保证结果稳定、不依赖云端返回顺序。
+        """
+        stage_minutes: dict[str, int] = {}
+        for stage in info["stages"]:
+            stage_minutes[stage.stage] = stage_minutes.get(stage.stage, 0) + stage.minutes
+        real_minutes = (
+            stage_minutes.get("deep", 0) + stage_minutes.get("light", 0) + stage_minutes.get("awake", 0)
+        )
+        if stage_minutes.get("rem", 0) > 0:
+            tier, info_minutes = 0, stage_minutes["rem"]
+        elif real_minutes > 0:
+            tier, info_minutes = 1, real_minutes
+        else:
+            tier, info_minutes = 2, 0
+        # 更长的 duration 更优先，所以取负数；入睡时间仅用于完全平手时的稳定性
+        return tier, -info_minutes, -info["duration_minutes"], info["start_at"].isoformat()
+
+    def _group_sleep_records(self, infos: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """把入睡时间相差 ≤ ``SLEEP_GROUP_WINDOW_MINUTES`` 的记录归为一组。
+
+        按入睡时间排序后顺序扫描：与组内上一条记录入睡时间相差 ≤60 分钟的并入同一组。
+        用实际时间差而不是对齐后的时间窗，因为对齐窗口会让「61 分钟」这种恰好跨界
+        的两条落进相邻窗口，从而被误合并。
+        """
+        groups: list[list[dict[str, Any]]] = []
+        for info in sorted(infos, key=lambda entry: entry["start_at"]):
+            if groups:
+                gap = info["start_at"] - groups[-1][-1]["start_at"]
+                if gap <= timedelta(minutes=self.SLEEP_GROUP_WINDOW_MINUTES):
+                    groups[-1].append(info)
+                    continue
+            groups.append([info])
+        return groups
+
+    def _dedupe_sleep_records(self, infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """同一晚只保留信息量最高的一条，单条组原样保留。
+
+        实测 365 天 448 条云端记录中有 21 组是同一晚的两条：健康平台
+        （``hlth.gen_*``）与设备直传（``749078412_*``）各记了一份。两边的分期
+        覆盖不同 —— 400 条里有 REM 的通常是设备直传，有真实分期的多是健康平台，
+        所以不能按来源一刀切，只能按信息量排序（见 ``_sleep_classify``）。
+        """
+        kept = [min(group, key=self._sleep_classify) for group in self._group_sleep_records(infos)]
+        if len(kept) != len(infos):
+            logger.info(
+                "Mi Fitness sleep dedupe: %d records -> %d (same-night duplicates removed)",
+                len(infos),
+                len(kept),
+            )
+        kept.sort(key=lambda info: (info["start_at"], info["end_at"]))
+        return kept
+
     async def iter_sleep_sessions(
         self,
         start_date: str | None = None,
@@ -566,49 +692,12 @@ class MiFitnessCloudAdapter(DataAdapter):
             yield
 
         records = await self._fetch_key("sleep", start_date, end_date)
-        for item in records:
-            payload = self._parse_value(item)
-            zone_offset = int(item.get("zone_offset", 0) or 0)
-            sleep_start = (
-                payload.get("bedtime")
-                or payload.get("device_bedtime")
-                or payload.get("bed_timestamp")
-            )
-            sleep_end = (
-                payload.get("wake_up_time")
-                or payload.get("device_wake_up_time")
-                or payload.get("out_bed_timestamp")
-                or item.get("time")
-            )
-            if not sleep_start or not sleep_end:
-                continue
-
-            start_at = self._timestamp_to_datetime(sleep_start, zone_offset)
-            end_at = self._timestamp_to_datetime(sleep_end, zone_offset)
-            duration_minutes = int(
-                payload.get("duration") or max(0, (int(sleep_end) - int(sleep_start)) // 60)
-            )
-            awake_minutes = int(
-                payload.get("awake_duration") or payload.get("sleep_awake_duration") or 0
-            )
-            asleep_minutes = max(0, duration_minutes - awake_minutes)
-
-            stages: list[SleepStage] = []
-            for segment in payload.get("items", []) or []:
-                try:
-                    seg_start = int(segment.get("start_time", 0))
-                    seg_end = int(segment.get("end_time", 0))
-                    minutes = max(0, (seg_end - seg_start) // 60)
-                    if minutes:
-                        stages.append(
-                            SleepStage(
-                                stage=self._sleep_stage_name(segment.get("state")), minutes=minutes
-                            )
-                        )
-                except Exception:
-                    continue
-
-            sleep_id = f"{item.get('sid', self.user_id)}_{item.get('time', int(sleep_end))}"
+        infos = [info for info in map(self._sleep_record_info, records) if info is not None]
+        for info in self._dedupe_sleep_records(infos):
+            item = info["item"]
+            payload = info["payload"]
+            record_time = item.get("time") or int(info["end_at"].timestamp())
+            sleep_id = f"{item.get('sid', self.user_id)}_{record_time}"
             yield SleepSession(
                 id=f"mi_fitness_sleep_{sleep_id}",
                 provider="mi_fitness",
@@ -618,14 +707,16 @@ class MiFitnessCloudAdapter(DataAdapter):
                 timezone=item.get("zone_name") or "UTC",
                 collected_at=self._record_datetime(item),
                 sleep_id=sleep_id,
-                start_at=start_at,
-                end_at=end_at,
-                duration_minutes=duration_minutes,
-                time_asleep_minutes=asleep_minutes,
-                time_awake_minutes=awake_minutes,
-                sleep_score=self._optional_int(payload.get("score") or payload.get("sleep_score")),
-                is_nap=self._is_nap_sleep(duration_minutes, end_at, item),
-                stages=stages,
+                start_at=info["start_at"],
+                end_at=info["end_at"],
+                duration_minutes=info["duration_minutes"],
+                time_asleep_minutes=info["asleep_minutes"],
+                time_awake_minutes=info["awake_minutes"],
+                sleep_score=self._optional_int(
+                    payload.get("score") or payload.get("sleep_score")
+                ),
+                is_nap=info["is_nap"],
+                stages=info["stages"],
             )
 
     async def iter_workouts(
