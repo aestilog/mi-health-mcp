@@ -1,5 +1,6 @@
 """SQLite storage layer for Mi Fitness MCP."""
 
+import contextlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -224,10 +225,12 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     data_type TEXT NOT NULL UNIQUE,
                     last_sync_at TIMESTAMP,
-                    last_record_timestamp TIMESTAMP,
-                    records_count INTEGER DEFAULT 0
+                    last_record_timestamp TIMESTAMP
                 )
             """)
+
+            # 老库迁移：已存在的表不会被 CREATE TABLE IF NOT EXISTS 改动结构
+            self._drop_records_count_if_exists(conn)
 
             # 创建索引以提升查询性能
             conn.execute("""
@@ -264,6 +267,18 @@ class Database:
             """)
 
             conn.commit()
+
+    @staticmethod
+    def _drop_records_count_if_exists(conn: sqlite3.Connection) -> None:
+        """老库迁移：删除已废弃的 records_count 列（恒为 0，无代码读写）。
+
+        幂等：列不存在时静默跳过；SQLite < 3.35 不支持 DROP COLUMN 时也不报错。
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
+        if "records_count" not in columns:
+            return
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute("ALTER TABLE sync_state DROP COLUMN records_count")
 
     @contextmanager
     def _get_connection(self):
