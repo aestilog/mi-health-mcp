@@ -8,9 +8,10 @@ import random
 import struct
 from collections import defaultdict
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import Any
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -440,17 +441,44 @@ class MiFitnessCloudAdapter(DataAdapter):
         return items
 
     def _sleep_stage_name(self, state: Any) -> str:
+        """把云端的 state 数值映射为分期名。
+
+        映射依据 365 天 448 条云端记录实测：state 2 精确等于 ``sleep_deep_duration``、
+        3 等于 ``sleep_light_duration``、5 等于 ``sleep_awake_duration``；4 为 REM；
+        6 表示「有睡眠但设备未做分期分析」。state 1 从未出现，未知值一律归入
+        ``unclassified``，不能伪装成浅睡。
+        """
         mapping = {
-            1: "deep",
-            2: "light",
+            2: "deep",
             3: "light",
-            4: "awake",
-            5: "rem",
+            4: "rem",
+            5: "awake",
+            6: "unclassified",
         }
         try:
-            return mapping.get(int(state), "light")
-        except Exception:
-            return "light"
+            return mapping.get(int(state), "unclassified")
+        except (TypeError, ValueError, OverflowError):
+            return "unclassified"
+
+    def _sleep_timezone(self, item: dict) -> tzinfo:
+        """按记录的 ``zone_name`` 取时区，缺失或非法时退回 UTC。"""
+        zone_name = item.get("zone_name")
+        if zone_name:
+            try:
+                return ZoneInfo(str(zone_name))
+            except (ZoneInfoNotFoundError, ValueError):
+                pass
+        return UTC
+
+    def _is_nap_sleep(self, duration_minutes: int, end_at: datetime, item: dict) -> bool:
+        """午睡判定：时长 < 60 分钟，且醒来时间落在本地 11:00-16:59。
+
+        云端 ``is_nap`` 字段恒为 null，不能用；用 ``end_at`` 而不是 ``start_at``，
+        因为入睡可能早于 11 点而醒来在 11-16 点之间。小时数必须按记录自带的
+        ``zone_name`` 换算成本地时间，不能直接用 UTC。
+        """
+        local_end = end_at.astimezone(self._sleep_timezone(item))
+        return duration_minutes < 60 and 11 <= local_end.hour <= 16
 
     def _optional_float(self, value: Any) -> float | None:
         if value is None:
@@ -596,7 +624,7 @@ class MiFitnessCloudAdapter(DataAdapter):
                 time_asleep_minutes=asleep_minutes,
                 time_awake_minutes=awake_minutes,
                 sleep_score=self._optional_int(payload.get("score") or payload.get("sleep_score")),
-                is_nap=bool(payload.get("is_nap", False)),
+                is_nap=self._is_nap_sleep(duration_minutes, end_at, item),
                 stages=stages,
             )
 

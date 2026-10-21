@@ -36,7 +36,9 @@ class DailyActivity(BaseEntity):
 class SleepStage(BaseModel):
     """Sleep stage information."""
 
-    stage: Literal["deep", "light", "rem", "awake"] = Field(description="Sleep stage")
+    stage: Literal["deep", "light", "rem", "awake", "unclassified"] = Field(
+        description="Sleep stage"
+    )
     minutes: int = Field(ge=0, description="Duration in minutes")
 
 
