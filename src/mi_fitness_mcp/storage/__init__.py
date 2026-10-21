@@ -1,7 +1,7 @@
 """SQLite storage layer for Mi Fitness MCP."""
 
-import contextlib
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -18,6 +18,11 @@ from mi_fitness_mcp.models import (
     StressSample,
     Workout,
 )
+
+logger = logging.getLogger(__name__)
+
+# DROP COLUMN 是 SQLite 3.35.0 引入的
+SQLITE_MIN_VERSION_FOR_DROP_COLUMN = (3, 35, 0)
 
 
 class Database:
@@ -272,13 +277,21 @@ class Database:
     def _drop_records_count_if_exists(conn: sqlite3.Connection) -> None:
         """老库迁移：删除已废弃的 records_count 列（恒为 0，无代码读写）。
 
-        幂等：列不存在时静默跳过；SQLite < 3.35 不支持 DROP COLUMN 时也不报错。
+        幂等：列不存在时静默跳过。
+        SQLite < 3.35 不支持 DROP COLUMN，此时保留该列（无功能影响），
+        其他异常（如列被索引依赖）不吞掉，让调用方知道迁移失败。
         """
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
         if "records_count" not in columns:
             return
-        with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute("ALTER TABLE sync_state DROP COLUMN records_count")
+        if sqlite3.sqlite_version_info < SQLITE_MIN_VERSION_FOR_DROP_COLUMN:
+            logger.warning(
+                "SQLite %s < 3.35, cannot drop sync_state.records_count; "
+                "column left in place (harmless, no code reads it)",
+                sqlite3.sqlite_version,
+            )
+            return
+        conn.execute("ALTER TABLE sync_state DROP COLUMN records_count")
 
     @contextmanager
     def _get_connection(self):
